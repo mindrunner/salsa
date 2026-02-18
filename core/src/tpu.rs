@@ -119,6 +119,10 @@ impl SigVerifier {
 // Conservatively allow 20 TPS per validator.
 pub const MAX_VOTES_PER_SECOND: u64 = 20;
 
+/// Size of the channel between streamer and TPU sigverify stage. The values have been selected to
+/// be conservative max of obsersed on mnb during high-load events.
+const TPU_CHANNEL_SIZE: usize = 50_000;
+
 pub struct Tpu {
     fetch_stage: FetchStage,
     sig_verifier: SigVerifier,
@@ -219,6 +223,7 @@ impl Tpu {
         let (fetch_stage_manager_sender, fetch_stage_manager_receiver) = unbounded();
         let (sigverify_stage_sender, sigverify_stage_receiver) = unbounded();
 
+        let (packet_sender, packet_receiver) = bounded(TPU_CHANNEL_SIZE);
         let (vote_packet_sender, vote_packet_receiver) = unbounded();
         let (forwarded_packet_sender, forwarded_packet_receiver) = unbounded();
         let fetch_stage = FetchStage::new_with_sender(
