@@ -220,10 +220,8 @@ impl Tpu {
 
         // Packets from fetch stage and quic server are intercepted and sent through fetch_stage_manager
         // If relayer is connected, packets are dropped. If not, packets are forwarded on to packet_sender
-        let (fetch_stage_manager_sender, fetch_stage_manager_receiver) = unbounded();
+        let (fetch_stage_manager_sender, fetch_stage_manager_receiver) = bounded(TPU_CHANNEL_SIZE);
         let (sigverify_stage_sender, sigverify_stage_receiver) = unbounded();
-
-        let (packet_sender, packet_receiver) = bounded(TPU_CHANNEL_SIZE);
         let (vote_packet_sender, vote_packet_receiver) = unbounded();
         let (forwarded_packet_sender, forwarded_packet_receiver) = unbounded();
         let fetch_stage = FetchStage::new_with_sender(

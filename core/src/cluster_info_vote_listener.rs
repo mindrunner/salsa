@@ -449,6 +449,7 @@ impl ClusterInfoVoteListener {
             return;
         }
 
+        let root = root_bank.slot();
         let (last_vote_slot, last_vote_hash) = vote.last_voted_slot_hash().unwrap();
 
         let latest_vote_slot = latest_vote_slot_per_validator
