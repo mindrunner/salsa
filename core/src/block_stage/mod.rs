@@ -105,6 +105,65 @@ impl BlockStage {
     /// Max serialized transaction size
     const MAX_TXN_SIZE: usize = 1232;
 
+    /// Check if the current bank is past the delegation period (last 1/8 of slot).
+    fn past_delegation_period(bank: &Bank) -> bool {
+        let current_tick_height = bank.tick_height();
+        let max_tick_height = bank.max_tick_height();
+        let bank_ticks_per_slot = bank.ticks_per_slot();
+        let start_tick = max_tick_height - bank_ticks_per_slot;
+        let ticks_into_slot = current_tick_height.saturating_sub(start_tick);
+        let delegation_period_length = bank_ticks_per_slot * 7 / 8;
+        ticks_into_slot >= delegation_period_length
+    }
+
+    /// Process a single streamed message: translate packets and execute.
+    /// Returns true on success, false on failure.
+    #[allow(clippy::too_many_arguments)]
+    fn process_single_message(
+        consumer: &mut BlockConsumer,
+        block: &HarmonicBlock,
+        working_bank: &Bank,
+        root_bank: &Bank,
+        tip_manager: &TipManager,
+        block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
+        keypair: &Keypair,
+        crank_buffer: &mut [[u8; Self::MAX_TXN_SIZE]; Self::MAX_CRANK_TXNS],
+        crank_lens: &mut [usize; Self::MAX_CRANK_TXNS],
+        prepend_crank: bool,
+    ) -> bool {
+        let (mut transactions, mut max_ages) = Self::translate_packets_to_transactions(
+            block.transactions(),
+            root_bank,
+            working_bank,
+        );
+
+        if prepend_crank {
+            Self::maybe_prepend_crank(
+                working_bank,
+                root_bank,
+                tip_manager,
+                block_builder_fee_info,
+                keypair,
+                crank_buffer,
+                crank_lens,
+                &mut transactions,
+                &mut max_ages,
+            );
+        }
+
+        let output = consumer.process_and_record_block_transactions(
+            working_bank,
+            &transactions,
+            &max_ages,
+            block.intended_slot(),
+        );
+
+        output
+            .execute_and_commit_transactions_output
+            .commit_transactions_result
+            .is_ok()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn process_loop(
         bank_forks: Arc<RwLock<BankForks>>,
@@ -131,14 +190,13 @@ impl BlockStage {
                         )
                     };
 
-                    let intended_slot = block.intended_slot();
                     let current_slot = working_bank.slot();
 
                     // Check if this block is for the correct slot
-                    if intended_slot != current_slot {
+                    if block.intended_slot() != current_slot {
                         info!(
                             "Block intended for slot {} but current slot is {}, dropping",
-                            intended_slot, current_slot
+                            block.intended_slot(), current_slot
                         );
                         continue;
                     }
@@ -168,17 +226,10 @@ impl BlockStage {
                         // before proceeding with block execution.
                         scheduler_synchronization::wait_for_votes_to_finish();
 
-                        // Translate packets to RuntimeTransaction<ResolvedTransactionView>
-                        // using zerocopy TransactionView instead of bincode deserialization
-                        let (mut transactions, mut max_ages) =
-                            Self::translate_packets_to_transactions(
-                                &block.transactions(),
-                                &root_bank,
-                                &working_bank,
-                            );
-
-                        // Prepend crank transactions if needed
-                        Self::maybe_prepend_crank(
+                        // Process first message (with crank prepend)
+                        let mut failed = !Self::process_single_message(
+                            &mut consumer,
+                            &block,
                             &working_bank,
                             &root_bank,
                             &tip_manager,
@@ -186,28 +237,53 @@ impl BlockStage {
                             &keypair,
                             &mut crank_buffer,
                             &mut crank_lens,
-                            &mut transactions,
-                            &mut max_ages,
+                            true, // prepend crank on first message
                         );
 
-                        // Process blocks
-                        let output = consumer.process_and_record_block_transactions(
-                            &working_bank,
-                            &transactions,
-                            &max_ages,
-                            intended_slot,
-                        );
+                        // Stream loop: keep receiving messages for this slot
+                        while !failed {
+                            if Self::past_delegation_period(&working_bank) {
+                                break;
+                            }
+
+                            match block_receiver.recv_timeout(Duration::from_millis(1)) {
+                                Ok(next_block) => {
+                                    if next_block.intended_slot() != current_slot {
+                                        info!(
+                                            "Streaming: block for slot {} during slot {}, stopping stream",
+                                            next_block.intended_slot(), current_slot
+                                        );
+                                        break;
+                                    }
+
+                                    // Wait for any in-flight vote batch before each message
+                                    scheduler_synchronization::wait_for_votes_to_finish();
+
+                                    failed = !Self::process_single_message(
+                                        &mut consumer,
+                                        &next_block,
+                                        &working_bank,
+                                        &root_bank,
+                                        &tip_manager,
+                                        &block_builder_fee_info,
+                                        &keypair,
+                                        &mut crank_buffer,
+                                        &mut crank_lens,
+                                        false, // no crank after first message
+                                    );
+                                }
+                                Err(RecvTimeoutError::Timeout) => continue,
+                                Err(RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
 
                         // Always restore vote limit after block execution attempt
                         working_bank.restore_vote_limit();
 
-                        if let Err(e) = output
-                            .execute_and_commit_transactions_output
-                            .commit_transactions_result
-                        {
+                        if failed {
                             info!(
-                                "Block failed for slot {}, reverting to vanilla: {:?}",
-                                current_slot, e
+                                "Block failed for slot {}, reverting to vanilla",
+                                current_slot,
                             );
                             scheduler_synchronization::block_failed(current_slot);
                         } else {
