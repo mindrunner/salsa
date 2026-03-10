@@ -799,7 +799,7 @@ dependencies = [
  "getrandom 0.3.4",
  "lru-slab",
  "rand 0.9.0",
- "ring",
+ "ring 0.17.14",
  "rustc-hash 2.0.0",
  "rustls 0.23.34",
  "rustls-pki-types",
@@ -4302,7 +4302,7 @@ dependencies = [
 
 [[package]]
 name = "jito-protos"
-version = "3.1.9"
+version = "3.1.10"
 dependencies = [
  "bytes",
  "prost",
@@ -7799,7 +7799,7 @@ dependencies = [
 
 [[package]]
 name = "solana-bundle"
-version = "3.1.9"
+version = "3.1.10"
 dependencies = [
  "itertools 0.12.1",
  "sha2 0.10.9",
