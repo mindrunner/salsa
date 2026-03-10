@@ -6,8 +6,9 @@
 //! Otherwise, vanilla scheduling takes over during fallback stage.
 //!
 //! The state is stored in a single atomic u64:
-//! - Top bit (bit 63): 1 = claimed by block, 0 = claimed by vanilla
-//! - Lower 63 bits: slot number
+//! - Bit 63: 1 = claimed by block, 0 = claimed by vanilla
+//! - Bit 62: 1 = block is actively executing a message (blocks votes)
+//! - Lower 62 bits: slot number
 //! - Sentinel value (u64::MAX) indicates no slot has been scheduled yet
 
 use {
@@ -17,10 +18,12 @@ use {
 
 /// Top bit indicates block claimed (1) vs vanilla claimed (0)
 const BLOCK_CLAIMED_BIT: u64 = 1 << 63;
-/// Mask to extract the slot number (lower 63 bits)
-const SLOT_MASK: u64 = !BLOCK_CLAIMED_BIT;
+/// Second bit indicates block is actively executing a message
+const BLOCK_EXECUTING_BIT: u64 = 1 << 62;
+/// Mask to extract the slot number (lower 62 bits)
+const SLOT_MASK: u64 = !(BLOCK_CLAIMED_BIT | BLOCK_EXECUTING_BIT);
 /// Sentinel value - all bits set, indicates no slot scheduled yet.
-/// Note: get_slot(SENTINEL) = 0x7FFFFFFFFFFFFFFF which is far larger than any real slot.
+/// Note: get_slot(SENTINEL) = 0x3FFFFFFFFFFFFFFF which is far larger than any real slot.
 const SENTINEL: u64 = u64::MAX;
 
 /// Module private state. Shared with block & vanilla schedulers.
@@ -134,6 +137,12 @@ pub fn block_should_schedule(current_slot: u64, in_delegation_period: bool) -> O
         return None;
     }
 
+    // Already claimed by block for this slot — allow continued consumption
+    let state = SCHEDULER_STATE.load(Ordering::Acquire);
+    if state != SENTINEL && get_slot(state) == current_slot && is_block_claim(state) {
+        return Some(true);
+    }
+
     // Try to claim the slot atomically with block flag set
     let new_state = block_claim(current_slot);
     let did_claim = SCHEDULER_STATE
@@ -168,13 +177,20 @@ pub fn block_should_schedule(current_slot: u64, in_delegation_period: bool) -> O
 /// Check if a block is currently executing for the given slot.
 /// Used by vote worker to defer vote processing during block execution.
 ///
-/// Returns true if the block claim bit is set for the current slot.
+/// Returns true if the executing bit is set for the current slot.
 pub fn is_block_executing(current_slot: u64) -> bool {
     let state = SCHEDULER_STATE.load(Ordering::Acquire);
     if state == SENTINEL {
         return false;
     }
-    get_slot(state) == current_slot && is_block_claim(state)
+    get_slot(state) == current_slot && state & BLOCK_EXECUTING_BIT != 0
+}
+
+/// Check if the slot is claimed by block (consuming, regardless of executing).
+/// Used by block stage to know when to restore vote limit after delegation ends.
+pub fn is_block_consuming(current_slot: u64) -> bool {
+    let state = SCHEDULER_STATE.load(Ordering::Acquire);
+    state != SENTINEL && get_slot(state) == current_slot && is_block_claim(state)
 }
 
 /// Called by vote worker before processing a vote batch.
@@ -201,6 +217,18 @@ pub fn wait_for_votes_to_finish() {
     while VOTE_PROCESSING.load(Ordering::Acquire) {
         std::hint::spin_loop();
     }
+}
+
+/// Called by block stage before executing a message. Sets the executing bit
+/// so that vote processing is deferred during execution.
+pub fn begin_block_execution() {
+    SCHEDULER_STATE.fetch_or(BLOCK_EXECUTING_BIT, Ordering::SeqCst);
+}
+
+/// Called by block stage after executing a message. Clears the executing bit
+/// so that votes can process between messages.
+pub fn end_block_execution() {
+    SCHEDULER_STATE.fetch_and(!BLOCK_EXECUTING_BIT, Ordering::Release);
 }
 
 /// Called when block execution has finished successfully.
@@ -230,41 +258,6 @@ pub fn block_execution_finished(current_slot: u64) -> bool {
             Some(vanilla_claim(current_slot))
         })
         .is_ok()
-}
-
-/// If block failed, we should revert and give vanilla a chance.
-/// This atomically clears the block claim and sets the slot to current_slot - 1
-/// so that vanilla can claim the current slot.
-pub fn block_failed(current_slot: u64) -> Option<bool> {
-    // Atomically revert if we're still on the same slot with block claim
-    let did_revert = SCHEDULER_STATE
-        .fetch_update(Ordering::Release, Ordering::Acquire, |old_state| {
-            // Only revert if currnt slot is claimed by block
-            if old_state == SENTINEL {
-                return None;
-            }
-
-            let old_slot = get_slot(old_state);
-            if old_slot != current_slot {
-                // Different slot, don't revert
-                return None;
-            }
-
-            if !is_block_claim(old_state) {
-                // Not claimed by block, don't revert
-                return None;
-            }
-
-            // Revert to previous slot (vanilla claim, so vanilla can now claim current_slot)
-            // Using wrapping_sub to handle slot 0 edge case
-            let new_state = vanilla_claim(current_slot.wrapping_sub(1));
-            Some(new_state)
-        })
-        .is_ok();
-
-    info!("block_failed did_revert={did_revert} in slot={current_slot}");
-
-    Some(did_revert)
 }
 
 /// Reset the scheduler synchronization state. Used in tests to ensure
@@ -383,53 +376,27 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_block_failed_reverts() {
-        reset_for_tests();
-
-        // Block claims slot 100
-        block_should_schedule(100, true);
-        assert!(is_slot_claimed_by_block());
-
-        // Block fails, should revert
-        let result = block_failed(100);
-        assert_eq!(result, Some(true));
-
-        // Now vanilla should be able to claim slot 100
-        let result = vanilla_should_schedule(100, false);
-        assert_eq!(result, Some(true));
-        assert!(!is_slot_claimed_by_block());
-    }
-
-    #[test]
-    #[serial]
-    fn test_block_failed_wrong_slot() {
-        reset_for_tests();
-
-        // Block claims slot 100
-        block_should_schedule(100, true);
-
-        // Try to revert slot 99 (wrong slot)
-        let result = block_failed(99);
-        assert_eq!(result, Some(false));
-
-        // Slot 100 should still be claimed by block
-        assert!(is_slot_claimed_by_block());
-        assert_eq!(last_slot_scheduled(), 100);
-    }
-
-    #[test]
-    #[serial]
     fn test_is_block_executing() {
         reset_for_tests();
 
         // No block executing initially (sentinel value)
         assert!(!is_block_executing(100));
 
-        // Block claims slot 100
+        // Block claims slot 100 - consuming but not yet executing
         block_should_schedule(100, true);
+        assert!(!is_block_executing(100));
+
+        // Begin execution - now executing
+        begin_block_execution();
         assert!(is_block_executing(100));
         assert!(!is_block_executing(99)); // Wrong slot
         assert!(!is_block_executing(101)); // Wrong slot
+
+        // End execution - back to consuming, not executing
+        end_block_execution();
+        assert!(!is_block_executing(100));
+        // Still claimed by block though
+        assert!(is_slot_claimed_by_block());
 
         // After vanilla claims, block is not executing
         reset_for_tests();
@@ -445,7 +412,6 @@ mod tests {
         // Block claims slot 100
         block_should_schedule(100, true);
         assert!(is_slot_claimed_by_block());
-        assert!(is_block_executing(100));
 
         // Block execution finishes
         let result = block_execution_finished(100);
@@ -472,7 +438,6 @@ mod tests {
 
         // Slot 100 should still be claimed by block
         assert!(is_slot_claimed_by_block());
-        assert!(is_block_executing(100));
     }
 
     #[test]

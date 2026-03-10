@@ -32,7 +32,10 @@ use {
     log::{info, warn},
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
-    solana_ledger::blockstore_processor::TransactionStatusSender,
+    solana_ledger::{
+        blockstore_processor::TransactionStatusSender,
+        leader_schedule_cache::LeaderScheduleCache,
+    },
     solana_poh::transaction_recorder::TransactionRecorder,
     solana_runtime::{
         bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
@@ -67,6 +70,7 @@ impl BlockStage {
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
         tip_manager: TipManager,
         block_builder_fee_info: Arc<Mutex<BlockBuilderFeeInfo>>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
     ) -> Self {
         let committer = Committer::new(
             transaction_status_sender,
@@ -89,6 +93,7 @@ impl BlockStage {
                     cluster_info,
                     tip_manager,
                     block_builder_fee_info,
+                    leader_schedule_cache,
                 );
             })
             .unwrap();
@@ -114,10 +119,13 @@ impl BlockStage {
         cluster_info: Arc<ClusterInfo>,
         tip_manager: TipManager,
         block_builder_fee_info: Arc<Mutex<BlockBuilderFeeInfo>>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
     ) {
         // Reusable buffer for crank transaction bytes
         let mut crank_buffer = [[0u8; Self::MAX_TXN_SIZE]; Self::MAX_CRANK_TXNS];
         let mut crank_lens = [0usize; Self::MAX_CRANK_TXNS];
+        let mut failed_slot: Option<u64> = None;
+        let mut vote_limit_restored_slot: Option<u64> = None;
 
         while !exit.load(Ordering::Relaxed) {
             match block_receiver.recv_timeout(Duration::from_millis(10)) {
@@ -159,13 +167,18 @@ impl BlockStage {
                         );
                     }
 
-                    // Attempt to claim the slot for block stage
-                    let decision = BufferedPacketsDecision::Consume(working_bank);
-                    if let BufferedPacketsDecision::Consume(working_bank) =
+                    // Claim the slot (or continue if already claimed by block for this slot)
+                    let decision = BufferedPacketsDecision::Consume(working_bank.clone());
+                    if let BufferedPacketsDecision::Consume(_) =
                         DecisionMaker::maybe_consume::<false>(decision)
                     {
-                        // Claimed! Wait for any in-flight vote batch to finish
-                        // before proceeding with block execution.
+                        // Skip execution for a slot that had a failure
+                        if failed_slot == Some(current_slot) {
+                            continue;
+                        }
+
+                        // Enter executing state and wait for any in-flight vote batch
+                        scheduler_synchronization::begin_block_execution();
                         scheduler_synchronization::wait_for_votes_to_finish();
 
                         // Translate packets to RuntimeTransaction<ResolvedTransactionView>
@@ -190,7 +203,7 @@ impl BlockStage {
                             &mut max_ages,
                         );
 
-                        // Process blocks
+                        // Process block message
                         let output = consumer.process_and_record_block_transactions(
                             &working_bank,
                             &transactions,
@@ -198,24 +211,40 @@ impl BlockStage {
                             intended_slot,
                         );
 
-                        // Always restore vote limit after block execution attempt
-                        working_bank.restore_vote_limit();
+                        // Exit executing state so votes can process between messages
+                        scheduler_synchronization::end_block_execution();
 
                         if let Err(e) = output
                             .execute_and_commit_transactions_output
                             .commit_transactions_result
                         {
                             info!(
-                                "Block failed for slot {}, reverting to vanilla: {:?}",
+                                "Block message failed for slot {}, halting block stage: {:?}",
                                 current_slot, e
                             );
-                            scheduler_synchronization::block_failed(current_slot);
-                        } else {
-                            scheduler_synchronization::block_execution_finished(current_slot);
+                            failed_slot = Some(current_slot);
+                            working_bank.restore_vote_limit();
+                            vote_limit_restored_slot = Some(current_slot);
                         }
-                    } else {
-                        // Failed to claim for this slot.
-                        info!("block stage failed to claim slot {}", current_slot);
+                    } else if scheduler_synchronization::is_block_consuming(current_slot) {
+                        if vote_limit_restored_slot != Some(current_slot) {
+                            working_bank.restore_vote_limit();
+                            vote_limit_restored_slot = Some(current_slot);
+                            info!("restored vote limit for slot {}", current_slot);
+                        }
+
+                        // If not leader in next slot, release the block claim
+                        // so vanilla/bundles can append non-vote transactions
+                        let keypair = cluster_info.keypair();
+                        let next_leader = leader_schedule_cache
+                            .slot_leader_at(current_slot + 1, Some(&working_bank));
+                        if next_leader != Some(keypair.pubkey()) {
+                            scheduler_synchronization::block_execution_finished(current_slot);
+                            info!(
+                                "released block claim for slot {} (not leader next)",
+                                current_slot
+                            );
+                        }
                         continue;
                     };
                 }
