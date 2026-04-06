@@ -26,9 +26,9 @@ use {
         },
     },
     solana_geyser_plugin_manager::GeyserPluginManagerRequest,
-    solana_metrics::datapoint_info,
     solana_gossip::contact_info::{ContactInfo, Protocol, SOCKET_ADDR_UNSPECIFIED},
     solana_keypair::{read_keypair_file, Keypair},
+    solana_metrics::datapoint_info,
     solana_pubkey::Pubkey,
     solana_rpc::rpc::verify_pubkey,
     solana_rpc_client_api::{config::RpcAccountIndex, custom_error::RpcCustomError},
@@ -1068,6 +1068,13 @@ impl AdminRpcImpl {
                     })?;
             }
 
+            let new_identity = identity_keypair.pubkey();
+            let mut keypairs = meta.authorized_voter_keypairs.write().unwrap();
+            if !keypairs.iter().any(|x| x.pubkey() == new_identity) {
+                keypairs.push(Arc::new(identity_keypair.insecure_clone()));
+            }
+            drop(keypairs);
+
             for (key, notifier) in &*post_init.notifies.read().unwrap() {
                 if let Err(err) = notifier.update_key(&identity_keypair) {
                     error!("Error updating network layer keypair: {err} on {key:?}");
@@ -1076,7 +1083,6 @@ impl AdminRpcImpl {
 
             let old_identity = post_init.cluster_info.id();
             let old_vote_account = *post_init.vote_account.read().unwrap();
-            let new_identity = identity_keypair.pubkey();
             solana_metrics::set_host_id(new_identity.to_string());
             datapoint_info!(
                 "validator-set_identity_and_vote_account",
@@ -1094,9 +1100,7 @@ impl AdminRpcImpl {
             post_init
                 .cluster_info
                 .set_keypair(Arc::new(identity_keypair));
-            warn!(
-                "Identity set to {new_identity}, vote account set to {new_vote_account}"
-            );
+            warn!("Identity set to {new_identity}, vote account set to {new_vote_account}");
             Ok(())
         })
     }

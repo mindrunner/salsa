@@ -5,7 +5,7 @@ use {
     },
     clap::{value_t, App, Arg, ArgMatches, SubCommand},
     solana_clap_utils::input_validators::is_keypair,
-    solana_keypair::{read_keypair, read_keypair_file},
+    solana_keypair::read_keypair_file,
     solana_pubkey::Pubkey,
     solana_signer::Signer,
     std::{fs, path::Path},
@@ -16,7 +16,7 @@ const COMMAND: &str = "set-identity-and-vote-account";
 #[derive(Debug, PartialEq)]
 #[cfg_attr(test, derive(Default))]
 pub struct SetIdentityAndVoteAccountArgs {
-    pub identity: Option<String>,
+    pub identity: String,
     pub vote_account: String,
     pub require_tower: bool,
 }
@@ -24,7 +24,9 @@ pub struct SetIdentityAndVoteAccountArgs {
 impl FromClapArgMatches for SetIdentityAndVoteAccountArgs {
     fn from_clap_arg_match(matches: &ArgMatches) -> Result<Self> {
         Ok(SetIdentityAndVoteAccountArgs {
-            identity: value_t!(matches, "identity", String).ok(),
+            identity: value_t!(matches, "identity", String).map_err(|e| {
+                clap::Error::with_description(&e.to_string(), clap::ErrorKind::ValueValidation)
+            })?,
             vote_account: value_t!(matches, "vote_account", String).map_err(|e| {
                 clap::Error::with_description(&e.to_string(), clap::ErrorKind::ValueValidation)
             })?,
@@ -75,18 +77,16 @@ pub fn command<'a>() -> App<'a, 'a> {
         .arg(
             Arg::with_name("identity")
                 .index(1)
+                .required(true)
                 .value_name("KEYPAIR")
-                .required(false)
-                .takes_value(true)
                 .validator(is_keypair)
-                .help("Path to validator identity keypair [default: read JSON keypair from stdin]"),
+                .help("Path to validator identity keypair"),
         )
         .arg(
             Arg::with_name("vote_account")
-                .long("vote-account")
-                .value_name("ADDRESS")
+                .index(2)
                 .required(true)
-                .takes_value(true)
+                .value_name("ADDRESS")
                 .validator(is_pubkey_or_keypair_or_pubkey_file)
                 .help(
                     "Vote account public key. Accepts a base58 pubkey, a path to a keypair file, \
@@ -116,45 +116,25 @@ pub fn execute(matches: &ArgMatches, ledger_path: &Path) -> Result<()> {
         .map_err(|e| clap::Error::with_description(&e, clap::ErrorKind::ValueValidation))?;
     let vote_account_str = vote_account_pubkey.to_string();
 
-    if let Some(identity_keypair) = identity {
-        let identity_keypair = fs::canonicalize(&identity_keypair)?;
+    let identity_keypair = fs::canonicalize(&identity)?;
 
-        println!(
-            "New validator identity path: {}",
-            identity_keypair.display()
-        );
-        println!("New vote account: {vote_account_str}");
+    println!(
+        "New validator identity path: {}",
+        identity_keypair.display()
+    );
+    println!("New vote account: {vote_account_str}");
 
-        let admin_client = admin_rpc_service::connect(ledger_path);
-        admin_rpc_service::runtime().block_on(async move {
-            admin_client
-                .await?
-                .set_identity_and_vote_account(
-                    identity_keypair.display().to_string(),
-                    vote_account_str,
-                    require_tower,
-                )
-                .await
-        })?;
-    } else {
-        let mut stdin = std::io::stdin();
-        let identity_keypair = read_keypair(&mut stdin)?;
-
-        println!("New validator identity: {}", identity_keypair.pubkey());
-        println!("New vote account: {vote_account_str}");
-
-        let admin_client = admin_rpc_service::connect(ledger_path);
-        admin_rpc_service::runtime().block_on(async move {
-            admin_client
-                .await?
-                .set_identity_and_vote_account_from_bytes(
-                    Vec::from(identity_keypair.to_bytes()),
-                    vote_account_str,
-                    require_tower,
-                )
-                .await
-        })?;
-    }
+    let admin_client = admin_rpc_service::connect(ledger_path);
+    admin_rpc_service::runtime().block_on(async move {
+        admin_client
+            .await?
+            .set_identity_and_vote_account(
+                identity_keypair.display().to_string(),
+                vote_account_str,
+                require_tower,
+            )
+            .await
+    })?;
 
     Ok(())
 }
@@ -180,14 +160,9 @@ mod tests {
 
         verify_args_struct_by_command(
             command(),
-            vec![
-                COMMAND,
-                file.to_str().unwrap(),
-                "--vote-account",
-                &vote_account_str,
-            ],
+            vec![COMMAND, file.to_str().unwrap(), &vote_account_str],
             SetIdentityAndVoteAccountArgs {
-                identity: Some(file.to_str().unwrap().to_string()),
+                identity: file.to_str().unwrap().to_string(),
                 vote_account: vote_account_str.clone(),
                 require_tower: false,
             },
@@ -210,11 +185,10 @@ mod tests {
             vec![
                 COMMAND,
                 id_file.to_str().unwrap(),
-                "--vote-account",
                 vote_file.to_str().unwrap(),
             ],
             SetIdentityAndVoteAccountArgs {
-                identity: Some(id_file.to_str().unwrap().to_string()),
+                identity: id_file.to_str().unwrap().to_string(),
                 vote_account: vote_file.to_str().unwrap().to_string(),
                 require_tower: false,
             },
@@ -241,11 +215,10 @@ mod tests {
             vec![
                 COMMAND,
                 id_file.to_str().unwrap(),
-                "--vote-account",
                 pubkey_file.to_str().unwrap(),
             ],
             SetIdentityAndVoteAccountArgs {
-                identity: Some(id_file.to_str().unwrap().to_string()),
+                identity: id_file.to_str().unwrap().to_string(),
                 vote_account: pubkey_file.to_str().unwrap().to_string(),
                 require_tower: false,
             },
@@ -271,12 +244,11 @@ mod tests {
             vec![
                 COMMAND,
                 file.to_str().unwrap(),
-                "--vote-account",
                 &vote_account_str,
                 "--require-tower",
             ],
             SetIdentityAndVoteAccountArgs {
-                identity: Some(file.to_str().unwrap().to_string()),
+                identity: file.to_str().unwrap().to_string(),
                 vote_account: vote_account_str.clone(),
                 require_tower: true,
             },
