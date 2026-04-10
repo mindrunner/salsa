@@ -530,14 +530,59 @@ fn retransmit_shred(
                     all_addrs.extend(shred_receiver_addresses.iter().copied());
                     &all_addrs
                 };
-                match multi_target_send(socket, &shred, send_addrs) {
-                    Ok(()) => num_addrs,
-                    Err(SendPktsError::IoError(ioerr, num_failed)) => {
-                        error!(
-                            "retransmit_to multi_target_send error: {ioerr:?}, \
-                             {num_failed}/{num_addrs} packets failed"
-                        );
-                        num_addrs - num_failed
+                let has_multicast = send_addrs.iter().any(|a| a.ip().is_multicast());
+                if has_multicast {
+                    let (mc_addrs, uc_addrs): (Vec<SocketAddr>, Vec<SocketAddr>) = send_addrs
+                        .iter()
+                        .copied()
+                        .partition(|addr| addr.ip().is_multicast());
+                    let mut sent = 0usize;
+                    if !uc_addrs.is_empty() {
+                        match multi_target_send(socket, &shred, &uc_addrs) {
+                            Ok(()) => sent += uc_addrs.len(),
+                            Err(SendPktsError::IoError(ioerr, num_failed)) => {
+                                error!(
+                                    "retransmit_to multi_target_send error: {ioerr:?}, \
+                                     {num_failed} packets failed"
+                                );
+                                sent += uc_addrs.len() - num_failed;
+                            }
+                        }
+                    }
+                    if !mc_addrs.is_empty() {
+                        thread_local! {
+                            static MC_SOCKET: UdpSocket = {
+                                let sock = UdpSocket::bind("0.0.0.0:0")
+                                    .expect("multicast socket bind");
+                                sock.set_multicast_ttl_v4(64)
+                                    .expect("set multicast ttl");
+                                sock
+                            };
+                        }
+                        MC_SOCKET.with(|mc_sock| {
+                            match multi_target_send(mc_sock, &shred, &mc_addrs) {
+                                Ok(()) => sent += mc_addrs.len(),
+                                Err(SendPktsError::IoError(ioerr, num_failed)) => {
+                                    error!(
+                                        "retransmit multicast error: {ioerr:?}, \
+                                         {num_failed} packets failed"
+                                    );
+                                    sent += mc_addrs.len() - num_failed;
+                                }
+                            }
+                        });
+                    }
+                    sent
+                } else {
+                    match multi_target_send(socket, &shred, send_addrs) {
+                        Ok(()) => num_addrs,
+                        Err(SendPktsError::IoError(ioerr, num_failed)) => {
+                            error!(
+                                "retransmit_to multi_target_send error: {ioerr:?}, \
+                                 {num_failed}/{num_addrs} packets failed"
+                            );
+                            num_addrs - num_failed
+                        }
                     }
                 }
             }
